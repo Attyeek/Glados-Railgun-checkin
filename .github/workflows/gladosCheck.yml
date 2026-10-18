@@ -60,7 +60,8 @@ jobs:
           python checkin.py
         fi
       env:
-        DIAGNOSE: ${{ inputs.diagnose }}
+        # Push validates credentials without changing account state; schedules still check in.
+        DIAGNOSE: ${{ github.event_name == 'push' || inputs.diagnose }}
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
         GLADOS_COOKIES_BY_DOMAIN: ${{ secrets.GLADOS_COOKIES_BY_DOMAIN }}
