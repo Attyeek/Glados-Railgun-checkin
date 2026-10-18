@@ -2,8 +2,13 @@ name: auto check
 
 on:
   workflow_dispatch:
+    inputs:
+      diagnose:
+        description: 'Read-only authentication diagnosis (no check-in or exchange)'
+        type: boolean
+        default: false
   push:
-    branches: [ main ]
+    branches: [ master ]
     paths-ignore:
       - 'README.md'
       - 'imgs/**'
@@ -43,17 +48,28 @@ jobs:
         pip install requests
         pip install pypushdeer
 
+    - name: Offline regression tests
+      run: python -m unittest discover -s tests -v
+
     # 执行 签到脚本
     - name: Running checkin
       run: |
-        python checkin.py
+        if [ "$DIAGNOSE" = "true" ]; then
+          python checkin.py --diagnose
+        else
+          python checkin.py
+        fi
       env:
+        # Push validates credentials without changing account state; schedules still check in.
+        DIAGNOSE: ${{ github.event_name == 'push' || inputs.diagnose }}
         PUSHDEER_SENDKEY: ${{ secrets.PUSHDEER_SENDKEY }}
         GLADOS_COOKIES: ${{ secrets.GLADOS_COOKIES }}
+        GLADOS_COOKIES_BY_DOMAIN: ${{ secrets.GLADOS_COOKIES_BY_DOMAIN }}
         GLADOS_EXCHANGE_PLAN: ${{ secrets.GLADOS_EXCHANGE_PLAN }}
         GLADOS_VERBOSE: ${{ secrets.GLADOS_VERBOSE }}
 
     - name: Keep alive
+      if: ${{ !cancelled() }}
       uses: liskin/gh-workflow-keepalive@v1 
         
     - name: Delete workflow runs
