@@ -1,4 +1,6 @@
 import requests
+import sys
+import argparse
 import json
 import os
 import logging
@@ -70,10 +72,10 @@ def log_method(func):
             result = func(self, *args, **kwargs)
             return result
         except Exception as e:
-            logger.error(f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}] {LogEmoji.ERROR} {method_name} 执行失败: {e}")
+            logger.error(f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}] {LogEmoji.ERROR} {method_name} 执行失败: {type(e).__name__}")
 
             DEFAULT_ERRORS = {
-                "checkin": {"status": "签到失败", "points": "0", "message": ""},
+                "checkin": {"status": "签到失败", "points": "0", "message": "", "code": CheckinStatus.FAILURE},
                 "get_status": ("None 天", -2),
                 "get_points": ("None 积分", 0),
                 "exchange": "",
@@ -83,7 +85,7 @@ def log_method(func):
                 error_template = DEFAULT_ERRORS[method_name]
                 if isinstance(error_template, dict):
                     error_result = error_template.copy()
-                    error_result["message"] = f"执行失败: {e}"
+                    error_result["message"] = f"执行失败: {type(e).__name__}"
                     return error_result
                 return error_template
             raise
@@ -98,6 +100,7 @@ class Config:
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_DOMAIN_COOKIES = "GLADOS_COOKIES_BY_DOMAIN"
 
     """默认兑换计划"""
     DEFAULT_EXCHANGE_PLAN = "plan500"
@@ -121,6 +124,30 @@ class Config:
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
         self._load_config()
+        self.domain_cookies = self._load_domain_cookies()
+
+    def _load_domain_cookies(self) -> Dict[str, List[str]]:
+        """Explicit mapping replaces legacy fan-out; never log its contents."""
+        raw = os.environ.get(self.ENV_DOMAIN_COOKIES, "").strip()
+        if not raw:
+            return {domain: self.cookies_list for domain in self.DOMAINS}
+        try:
+            mapping = json.loads(raw)
+            if not isinstance(mapping, dict) or not mapping:
+                raise ValueError
+            for domain, cookies in mapping.items():
+                if domain not in self.DOMAINS or not isinstance(cookies, list) or not cookies:
+                    raise ValueError
+                if any(not isinstance(c, str) or not c.strip() or "\r" in c or "\n" in c for c in cookies):
+                    raise ValueError
+            return {domain: [c.strip() for c in cookies] for domain, cookies in mapping.items()}
+        except (ValueError, TypeError):
+            raise ValueError("GLADOS_COOKIES_BY_DOMAIN 配置无效；需要允许域名到非空 Cookie 数组的 JSON 映射") from None
+
+    def iter_tasks(self):
+        for domain, cookies in self.domain_cookies.items():
+            for index, cookie in enumerate(cookies, 1):
+                yield index, domain, cookie
 
     def _load_config(self) -> None:
         """加载配置"""
@@ -135,7 +162,9 @@ class Config:
         else:
             self.push_key = push_key_env
 
-        if not raw_cookies_env:
+        if os.environ.get(self.ENV_DOMAIN_COOKIES, "").strip():
+            self.cookies_list = []
+        elif not raw_cookies_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
             self.cookies_list = []
         else:
@@ -151,7 +180,7 @@ class Config:
                 self.exchange_plan = exchange_plan_env
                 logger.info(f"{LogEmoji.SUCCESS} 使用指定的兑换计划: {self.exchange_plan}")
             else:
-                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 的值 '{exchange_plan_env}' 无效，将使用默认兑换计划 {self.DEFAULT_EXCHANGE_PLAN}。")
+                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EXCHANGE_PLAN}' 的值无效，将使用默认兑换计划 {self.DEFAULT_EXCHANGE_PLAN}。")
                 self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
 
         logger.info(f"{LogEmoji.INFO} 共加载了 {len(self.cookies_list)} 个 Cookie 用于签到。")
@@ -165,7 +194,7 @@ class Config:
             elif verbose_env_lower in ["false", "0", "no", "n"]:
                 self.verbose = False
             else:
-                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
+                logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
 
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
 
@@ -196,7 +225,7 @@ class API:
             try:
                 self.session.close()
             except Exception as e:
-                logger.error(f"{LogEmoji.ERROR} 关闭 session 时发生错误: {e}")
+                logger.error(f"{LogEmoji.ERROR} 关闭 session 时发生错误: {type(e).__name__}")
 
     def __enter__(self):
         """进入上下文管理器"""
@@ -211,6 +240,8 @@ class API:
         """获取请求头"""
         return {
             "origin": f"https://{self.domain}",
+            "referer": f"https://{self.domain}/console/checkin",
+            "accept": "application/json",
             "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36",
         }
 
@@ -238,19 +269,31 @@ class API:
 
         try:
             if method.upper() == "POST":
-                response = self.session.post(url, headers=session_headers, data=json.dumps(data), timeout=(60, 120))
+                response = self.session.post(url, headers=session_headers, json=data, timeout=(15, 30), allow_redirects=False)
             elif method.upper() == "GET":
-                response = self.session.get(url, headers=session_headers, timeout=(60, 120))
+                response = self.session.get(url, headers=session_headers, timeout=(15, 30), allow_redirects=False)
             else:
                 self._log("error", LogEmoji.ERROR, f"不支持的 HTTP 方法: {method}", force=True)
                 return None
 
-            if not response.ok:
-                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}。响应内容: {response.text}", force=True)
+            if not 200 <= response.status_code < 300:
+                self._log("warning", LogEmoji.WARNING, f"向 {url} 发起的请求失败，状态码 {response.status_code}；响应正文已省略", force=True)
                 return None
+            try:
+                payload = response.json()
+            except ValueError:
+                self._log("error", LogEmoji.ERROR, "响应不是 JSON；可能是登录页、网关或接口变更", force=True)
+                return None
+            if not isinstance(payload, dict):
+                self._log("error", LogEmoji.ERROR, "响应 JSON 不是对象", force=True)
+                return None
+            # Log only a scalar business code, never raw response data or headers.
+            code = payload.get("code")
+            safe_code = code if type(code) is int else "missing/invalid"
+            self._log("info", LogEmoji.INFO, f"{method} {url}: HTTP {response.status_code}, code={safe_code}", force=True)
             return response
         except requests.exceptions.RequestException as e:
-            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {e}", force=True)
+            self._log("error", LogEmoji.ERROR, f"向 {url} 发起请求时发生网络错误: {type(e).__name__}", force=True)
             return None
 
     def _get_checkin_data(self) -> Dict[str, str]:
@@ -273,9 +316,14 @@ class API:
 
         if response:
             data = response.json()
-            code = data.get("code", -2)
-            message = data.get("message", "无消息字段")
-            points = str(data.get("points", 0))
+            code = data.get("code")
+            code = code if type(code) is int else None
+            raw_message = data.get("message")
+            message = "鉴权/权限被拒绝；请检查该域名的会话与账号权限" if raw_message in ("没有权限", "No permission") else "服务端消息已省略"
+            if type(code) is not int:
+                code = None
+            value = data.get("points", 0)
+            points = str(value) if type(value) in (int, float) else "0"
 
             if code == CheckinStatus.SUCCESS.value:
                 self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points}, message : {message} }}")
@@ -312,15 +360,16 @@ class API:
 
         if response:
             data = response.json()
-            code = data.get("code", -2)
+            code = data.get("code")
+            code = code if type(code) is int else None
             left_days = data.get("data", {}).get("leftDays", None)
 
-            if left_days is not None:
+            if type(code) is int and code == 0 and left_days is not None:
                 left_days_int = int(float(left_days))
                 self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, leftDays : {left_days_int} 天}}")
                 return f"{left_days_int} 天", code
             else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, leftDays : {left_days} 天}}", force=True)
+                self._log("info", LogEmoji.FAIL, "状态查询失败；未获得有效剩余天数", force=True)
                 return "None 天", code
         else:
             self._log("warning", LogEmoji.WARNING, "获取状态失败", force=True)
@@ -334,17 +383,18 @@ class API:
 
         if response:
             data = response.json()
-            code = data.get("code", -2)
+            code = data.get("code")
+            code = code if type(code) is int else None
             points = data.get("points", None)
 
-            if points is not None:
+            if type(code) is int and code == 0 and points is not None:
                 points_int = int(float(points))
                 self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, points : {points_int} 积分}}")
                 points_str = f"{points_int} 积分"
                 points_num = points_int
                 return points_str, points_num
             else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, points : {points} 积分}}", force=True)
+                self._log("info", LogEmoji.FAIL, "积分查询失败；未获得有效积分", force=True)
                 return "None 积分", 0
         else:
             self._log("warning", LogEmoji.WARNING, "获取积分失败", force=True)
@@ -358,8 +408,9 @@ class API:
 
         if response:
             data = response.json()
-            code = data.get("code", -2)
-            message = data.get("message", "未知错误")
+            code = data.get("code")
+            code = code if type(code) is int else None
+            message = "服务端消息已省略"
 
             if code == 0:
                 self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, message : {message} }}")
@@ -398,7 +449,7 @@ class PushService:
 
     def send(self, title: str, content: str) -> bool:
         """发送推送"""
-        if not self.config.push_key:
+        if self.config is None or not self.config.push_key:
             logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
             return False
 
@@ -408,7 +459,7 @@ class PushService:
             logger.info(f"{LogEmoji.SUCCESS} 推送通知发送成功。")
             return True
         except Exception as e:
-            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {e}")
+            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {type(e).__name__}")
             return False
 
 
@@ -427,30 +478,23 @@ class Checker:
 
     def checkin_all(self):
         """执行所有签到任务"""
-        cookie_count = len(self.config.cookies_list)
-        domain_count = len(self.config.DOMAINS)
-        total_tasks = cookie_count * domain_count
-        task_idx = 0
-
-        logger.info(f"{LogEmoji.INFO} 共 {cookie_count} 个 Cookie, {domain_count} 个域名, 共 {total_tasks} 个任务")
-
-        for cookie_idx, cookie in enumerate(self.config.cookies_list, 1):
-            logger.info(f"{LogEmoji.START} ========== 开始处理 Cookie {cookie_idx} ==========")
-
-            for domain in self.config.DOMAINS:
-                task_idx += 1
-                logger.info(f"{LogEmoji.INFO} ----- 任务 {task_idx}/{total_tasks}: {LogEmoji.COOKIE}[{cookie_idx}] on {LogEmoji.DOMAIN}[{domain}] -----")
-
+        self.results = []
+        for cookie_idx, domain, cookie in self.config.iter_tasks():
+            try:
                 result = self._checkin_on_domain(cookie, cookie_idx, domain)
-                self.results.append(result)
+            except Exception as e:
+                self._log(cookie_idx, domain, LogEmoji.ERROR, f"任务异常: {type(e).__name__}", force=True)
+                result = CheckinResult(cookie_idx, domain)
+            self.results.append(result)
+            self._log(cookie_idx, domain, LogEmoji.INFO, f"结果: {result.status}", force=True)
 
-                result_message = f"结果: {result.status}"
-                if result.code == CheckinStatus.SUCCESS:
-                    if self.config.verbose:
-                        result_message = f"结果: {result.status}, 获得 {result.points} 积分, 剩余 {result.days}, 总 {result.points_total}, {result.exchange}"
-                    self._log(cookie_idx, domain, LogEmoji.SUCCESS, result_message, force=True)
-                else:
-                    self._log(cookie_idx, domain, LogEmoji.WARNING, result_message, force=True)
+    def exit_code(self) -> int:
+        """Every configured task must finish successfully or be already checked in."""
+        expected = sum(1 for _ in self.config.iter_tasks())
+        return int(expected == 0 or len(self.results) != expected or any(
+            result.code not in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT)
+            for result in self.results
+        ))
 
     def _checkin_on_domain(self, cookie: str, cookie_idx: int, domain: str) -> CheckinResult:
         result = CheckinResult(cookie_idx, domain)
@@ -467,6 +511,11 @@ class Checker:
             result.status = checkin_result["status"]
             result.code = checkin_result.get("code", CheckinStatus.FAILURE)
 
+            result.points = checkin_result.get("points", "0")
+            if result.code not in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT):
+                result.exchange = "签到失败，跳过兑换"
+                return result
+
             # 3. 获取积分
             self._log(cookie_idx, domain, LogEmoji.POINTS, "查询总积分")
             points_str, points_num = api.get_points(cookie)
@@ -480,7 +529,10 @@ class Checker:
                 LogEmoji.EXCHANGE,
                 f"开始兑换 {self.config.exchange_plan} (需要 {required_points} 积分)",
             )
-            result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+            if points_num >= required_points:
+                result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
+            else:
+                result.exchange = "积分不足或查询失败，跳过兑换"
 
         return result
 
@@ -507,7 +559,7 @@ class Checker:
             if self.config.verbose:
                 log_line = line
             else:
-                log_line = f"#{i} {res['status']}"
+                log_line = f"#{i} {res['domain']} Cookie[{res['cookie_index']}] {res['status']}"
             log_content_lines.append(log_line)
 
         content = "\n".join(send_content_lines)
@@ -519,14 +571,33 @@ class Checker:
 logger = init_logger()
 
 
-def main():
-    """主函数"""
+def diagnose(config: Config) -> int:
+    """Read-only authentication check; never sign in or redeem points."""
+    tasks = list(config.iter_tasks())
+    failed = not tasks
+    for index, domain, cookie in tasks:
+        with API(domain, index) as api:
+            response = api._make_request(api._get_full_url(api.STATUS_URL), "GET", cookies=cookie)
+            payload = response.json() if response is not None else {}
+            code = payload.get("code")
+            valid = type(code) is int and code == 0 and isinstance(payload.get("data"), dict) and payload["data"].get("leftDays") is not None
+            logger.info(f"Cookie[{index}] {domain}: 鉴权状态={'通过' if valid else '失败或响应无法确认'}")
+            failed = failed or not valid
+    return int(failed)
+
+
+def main(diagnose_only: bool = False) -> int:
+    """Return nonzero for missing config, any failed task, or script error."""
+    exit_code = 1
+    config = None
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
         config = Config()
+        if diagnose_only:
+            return diagnose(config)
 
-        if not config.cookies_list:
+        if not any(True for _ in config.iter_tasks()):
             logger.error(f"{LogEmoji.ERROR} 未找到有效的 Cookie, 退出程序。")
             title, content = "# 未找到 cookies!", ""
         else:
@@ -534,6 +605,7 @@ def main():
             logger.info(f"{LogEmoji.START} 步骤 2: 执行签到")
             checker = Checker(config)
             checker.checkin_all()
+            exit_code = checker.exit_code()
 
             # 3. 格式化结果
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
@@ -541,15 +613,21 @@ def main():
             logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
     except Exception as e:
-        logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content, log_content = "# 脚本执行出错", str(e), str(e)
+        exit_code = 1
+        logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {type(e).__name__}")
+        title, content, log_content = "# 脚本执行出错", type(e).__name__, type(e).__name__
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else "")
-    push_service.send(title, content)
-    logger.info(f"{LogEmoji.END} 签到完成")
+    try:
+        PushService(config).send(title, content)
+    except Exception as e:
+        logger.error(f"推送异常: {type(e).__name__}")
+    logger.info(f"{LogEmoji.END} 签到完成，退出码={exit_code}")
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--diagnose", action="store_true", help="只查询会话状态，不签到、不兑换")
+    sys.exit(main(parser.parse_args().diagnose))
